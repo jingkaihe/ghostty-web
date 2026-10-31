@@ -110,6 +110,8 @@ export class CanvasRenderer {
 
   // Viewport tracking (for scrolling)
   private lastViewportY: number = 0;
+  private lastRenderState?: unknown[];
+  private lastScrollbarOpacity: number = 0;
 
   // Current buffer being rendered (for grapheme lookups)
   private currentBuffer: IRenderable | null = null;
@@ -215,6 +217,7 @@ export class CanvasRenderer {
    * Remeasure font metrics (call after font loads or changes)
    */
   public remeasureFont(): void {
+    this.lastRenderState = undefined;
     this.metrics = this.measureFont();
   }
 
@@ -234,6 +237,7 @@ export class CanvasRenderer {
    * Resize canvas to fit terminal dimensions
    */
   public resize(cols: number, rows: number): void {
+    this.lastRenderState = undefined;
     const cssWidth = cols * this.metrics.width;
     const cssHeight = rows * this.metrics.height;
 
@@ -271,6 +275,9 @@ export class CanvasRenderer {
     scrollbackProvider?: IScrollbackProvider,
     scrollbarOpacity: number = 1
   ): void {
+    if (this.currentBuffer !== buffer) {
+      this.lastRenderState = undefined;
+    }
     // Store buffer reference for grapheme lookups in renderCell
     this.currentBuffer = buffer;
 
@@ -301,10 +308,63 @@ export class CanvasRenderer {
       this.lastViewportY = viewportY;
     }
 
-    // Check if cursor position changed or if blinking (need to redraw cursor line)
+    // The RAF loop may poll, but unchanged frames must not paint. In particular,
+    // the drawing path below redraws every scrollback row on changing frames.
+    // Snapshot scalar coordinates: selection/link objects may be reused or recreated.
+    const selection = this.selectionManager?.hasSelection()
+      ? this.selectionManager.getSelectionCoords()
+      : null;
+    const link = this.hoveredLinkRange;
+    const renderState = [
+      buffer,
+      scrollbackProvider,
+      dims.cols,
+      dims.rows,
+      this.canvas.width,
+      this.canvas.height,
+      this.metrics,
+      this.theme,
+      this.cursorStyle,
+      viewportY,
+      scrollbackLength,
+      scrollbarOpacity,
+      viewportY === 0 && cursor.visible && this.cursorVisible,
+      viewportY === 0 ? cursor.x : null,
+      viewportY === 0 ? cursor.y : null,
+      selection?.startCol,
+      selection?.startRow,
+      selection?.endCol,
+      selection?.endRow,
+      this.hoveredHyperlinkId,
+      link?.startX,
+      link?.startY,
+      link?.endX,
+      link?.endY,
+    ];
+    const unchanged = this.lastRenderState?.every((value, index) => value === renderState[index]);
+    if (!this.lastRenderState) {
+      forceAll = true;
+    }
+    // Restore the text under the scrollbar on its final fade frame. Merely
+    // stopping the overlay at zero opacity leaves its last pixels on the canvas.
+    if (scrollbarOpacity === 0 && this.lastScrollbarOpacity > 0) {
+      forceAll = true;
+    }
+    if (!forceAll && unchanged && !this.selectionManager?.getDirtySelectionRows().size) {
+      let dirty = false;
+      for (let row = 0; row < dims.rows; row++) {
+        if (buffer.isRowDirty(row)) {
+          dirty = true;
+          break;
+        }
+      }
+      if (!dirty) return;
+    }
+
+    // Restore the cursor row on visibility/style changes even without blinking.
     const cursorMoved =
       cursor.x !== this.lastCursorPosition.x || cursor.y !== this.lastCursorPosition.y;
-    if (cursorMoved || this.cursorBlink) {
+    if (cursorMoved || this.cursorBlink || !unchanged) {
       // Mark cursor lines as needing redraw
       if (!forceAll && !buffer.isRowDirty(cursor.y)) {
         // Need to redraw cursor line
@@ -500,6 +560,8 @@ export class CanvasRenderer {
     // This is critical - if we don't clear after a full redraw, the dirty
     // state persists and the next frame might not detect new changes properly.
     buffer.clearDirty();
+    this.lastRenderState = renderState;
+    this.lastScrollbarOpacity = scrollbarOpacity;
   }
 
   /**
@@ -787,6 +849,7 @@ export class CanvasRenderer {
    * Update theme colors
    */
   public setTheme(theme: ITheme): void {
+    this.lastRenderState = undefined;
     this.theme = { ...DEFAULT_THEME, ...theme };
 
     // Rebuild palette
@@ -814,6 +877,7 @@ export class CanvasRenderer {
    * Update font size
    */
   public setFontSize(size: number): void {
+    this.lastRenderState = undefined;
     this.fontSize = size;
     this.metrics = this.measureFont();
   }
@@ -822,6 +886,7 @@ export class CanvasRenderer {
    * Update font family
    */
   public setFontFamily(family: string): void {
+    this.lastRenderState = undefined;
     this.fontFamily = family;
     this.metrics = this.measureFont();
   }
@@ -985,6 +1050,7 @@ export class CanvasRenderer {
    * Clear entire canvas
    */
   public clear(): void {
+    this.lastRenderState = undefined;
     // clearRect first because fillRect composites rather than replaces,
     // so transparent/translucent backgrounds wouldn't clear previous content.
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
